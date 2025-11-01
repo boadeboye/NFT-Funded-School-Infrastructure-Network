@@ -1,0 +1,118 @@
+;; Funding-Pool.clar
+(define-constant ERR-NOT-AUTHORIZED u100)
+(define-constant ERR-PROJECT-NOT-FOUND u101)
+(define-constant ERR-INSUFFICIENT-BALANCE u102)
+(define-constant ERR-INVALID-AMOUNT u103)
+(define-constant ERR-ALREADY-INITIALIZED u104)
+(define-constant ERR-NOT-RELEASER u105)
+(define-constant ERR-EMERGENCY-LOCKED u106)
+
+(define-data-var admin principal tx-sender)
+(define-data-var emergency-locked bool false)
+(define-data-var fund-releaser-contract (optional principal) none)
+
+(define-map project-balances uint uint)
+(define-map project-contributions { project-id: uint, contributor: principal } uint)
+
+(define-read-only (get-project-balance (project-id uint))
+  (default-to u0 (map-get? project-balances project-id))
+)
+
+(define-read-only (get-contribution (project-id uint) (contributor principal))
+  (default-to u0 (map-get? project-contributions { project-id: project-id, contributor: contributor }))
+)
+
+(define-read-only (get-total-contributed (project-id uint))
+  (get-project-balance project-id)
+)
+
+(define-read-only (is-emergency-locked)
+  (var-get emergency-locked)
+)
+
+(define-public (initialize-project (project-id uint) (target-amount uint))
+  (let ((current-balance (get-project-balance project-id)))
+    (asserts! (is-eq tx-sender (var-get admin)) (err ERR-NOT-AUTHORIZED))
+    (asserts! (is-eq current-balance u0) (err ERR-ALREADY-INITIALIZED))
+    (asserts! (> target-amount u0) (err ERR-INVALID-AMOUNT))
+    (map-set project-balances project-id u0)
+    (ok true)
+  )
+)
+
+(define-public (contribute (project-id uint))
+  (let (
+    (amount (stx-get-balance tx-sender))
+    (current-balance (get-project-balance project-id))
+    (current-contrib (get-contribution project-id tx-sender))
+  )
+    (asserts! (> amount u0) (err ERR-INVALID-AMOUNT))
+    (asserts! (not (var-get emergency-locked)) (err ERR-EMERGENCY-LOCKED))
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set project-balances project-id (+ current-balance amount))
+    (map-set project-contributions
+      { project-id: project-id, contributor: tx-sender }
+      (+ current-contrib amount)
+    )
+    (ok amount)
+  )
+)
+
+(define-public (request-withdrawal (project-id uint) (amount uint) (recipient principal))
+  (let ((balance (get-project-balance project-id)))
+    (asserts! (is-some (var-get fund-releaser-contract)) (err ERR-NOT-RELEASER))
+    (asserts! (is-eq contract-caller (unwrap! (var-get fund-releaser-contract) (err ERR-NOT-RELEASER))) (err ERR-NOT-AUTHORIZED))
+    (asserts! (>= balance amount) (err ERR-INSUFFICIENT-BALANCE))
+    (asserts! (> amount u0) (err ERR-INVALID-AMOUNT))
+    (map-set project-balances project-id (- balance amount))
+    (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+    (ok true)
+  )
+)
+
+(define-public (emergency-transfer (amount uint) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err ERR-NOT-AUTHORIZED))
+    (asserts! (> amount u0) (err ERR-INVALID-AMOUNT))
+    (let ((contract-balance (stx-get-balance (as-contract tx-sender))))
+      (asserts! (>= contract-balance amount) (err ERR-INSUFFICIENT-BALANCE))
+      (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-fund-releaser (releaser principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err ERR-NOT-AUTHORIZED))
+    (var-set fund-releaser-contract (some releaser))
+    (ok true)
+  )
+)
+
+(define-public (toggle-emergency-lock)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err ERR-NOT-AUTHORIZED))
+    (var-set emergency-locked (not (var-get emergency-locked)))
+    (ok (var-get emergency-locked))
+  )
+)
+
+(define-public (admin-withdraw-all (project-id uint) (recipient principal))
+  (let ((balance (get-project-balance project-id)))
+    (asserts! (is-eq tx-sender (var-get admin)) (err ERR-NOT-AUTHORIZED))
+    (asserts! (> balance u0) (err ERR-INSUFFICIENT-BALANCE))
+    (map-delete project-balances project-id)
+    (try! (as-contract (stx-transfer? balance tx-sender recipient)))
+    (ok balance)
+  )
+)
+
+(define-public (get-all-contributors (project-id uint))
+  (ok (fold (lambda (contrib acc) 
+    (if (> (get contrib contrib) u0)
+      (concat acc (list (get contributor contrib)))
+      acc
+    )
+  ) (map-get? project-contributions project-id) (list)))
+)
